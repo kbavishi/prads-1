@@ -48,11 +48,12 @@
 #define CONFDIR "/etc/prads/"
 #endif
 
-#define ARGS "C:c:b:d:Dg:hi:p:r:u:va:l:L:f:qtxs:OXFRMSAKUTIZtHPB"
+#define ARGS "C:c:b:d:EDg:hi:p:r:u:va:l:L:f:qtxs:OXFRMSAKUTIZtHPB"
 
 /*  G L O B A L S  *** (or candidates for refactoring, as we say)***********/
 globalconfig config;
 extern int optind, opterr, optopt; // getopt()
+static int lazy_filter = 0;
 
 time_t tstamp;
 servicelist *services[MAX_PORTS];
@@ -697,6 +698,100 @@ void parse_tcp (packetinfo *pi)
                 return;
             }
         } 
+    }
+
+    if (lazy_filter) {
+        // Try to be lazy and filter out uninteresting packets
+        if (TCP_ISFLAGSET(pi->tcph, (TF_SYN)) ||
+            TCP_ISFLAGSET(pi->tcph, (TF_RST)) ||
+            TCP_ISFLAGSET(pi->tcph, (TF_FIN))) {
+            goto PUNT;
+        } else if (ntohs(pi->s_port) == 80 || ntohs(pi->d_port) == 80) {
+            // This is an HTTP packet
+            if (pi->plen < 7) {
+                // This is not an HTTP request packet
+                goto UNPUNT;
+            }
+            uint8_t p[7];
+            int i = 0;
+            int j = 0;
+            p[j++] = pi->payload[i++];
+            p[j++] = pi->payload[i++];
+            p[j++] = pi->payload[i++];
+            p[j++] = pi->payload[i++];
+            p[j++] = pi->payload[i++];
+            p[j++] = pi->payload[i++];
+            p[j++] = pi->payload[i++];
+
+            //find a match with an HTTP message
+            //HTTP
+            if ((p[0] == 'H') && (p[1] == 'T') && (p[2] == 'T') && (p[3] == 'P')) {
+                goto PUNT;
+            }
+            //GET
+            if ((p[0] == 'G') && (p[1] == 'E') && (p[2] == 'T')) {
+                goto PUNT;
+            }
+            //POST
+            if ((p[0] == 'P') && (p[1] == 'O') && (p[2] == 'S') && (p[3] == 'T')) {
+                goto PUNT;
+            }
+            //PUT
+            if ((p[0] == 'P') && (p[1] == 'U') && (p[2] == 'T')) {
+                goto PUNT;
+            }
+            //DELETE
+            if ((p[0] == 'D') && (p[1] == 'E') && (p[2] == 'L') && (p[3] == 'E') &&
+                (p[4] == 'T') && (p[5] == 'E')) {
+                goto PUNT;
+            }
+            //HEAD
+            if ((p[0] == 'H') && (p[1] == 'E') && (p[2] == 'A') && (p[3] == 'D')) {
+                goto PUNT;
+            }
+
+        } else if (ntohs(pi->s_port) == 443 || ntohs(pi->d_port) == 443) {
+            // This is an SSL packet
+            if(pi->plen < 3) {
+                // This is an SSL packet with a very small payload. Can't be
+                // the handshake packet we are interested in. Drop early
+                goto UNPUNT;
+            }
+
+            //load first 3 byte of payload into p (payload_array)
+            //direct access to skb not allowed
+            uint8_t p[5];
+            int i = 0;
+            int j = 0;
+            p[j++] = pi->payload[i++];
+            p[j++] = pi->payload[i++];
+            p[j++] = pi->payload[i++];
+
+            if ((p[0] == 0x16) && (p[1] == 0x03)) {
+                // This seems like an SSL record. Punt please.
+                // Version 0x0300 is SSLv3, 0x0301 is TLSv1
+                goto PUNT;
+            }
+
+            // Check if this is an SSLv2 record with its weird signature by loading
+            // another 2 bytes
+            if(pi->plen < 5) {
+                goto UNPUNT;
+            }
+            p[j++] = pi->payload[i++];
+            p[j++] = pi->payload[i++];
+            if ((p[2] == 0x01) && (p[3] == 0x03) && (p[4] == 0x01)) {
+                // SSL v2.0: First two bytes denote length
+                goto PUNT;
+            }
+
+        } else {
+            // This packet does not have any SYN, RST, FIN flags and is also
+            // not an HTTP packet. Need to analyze this.
+            goto PUNT;
+        }
+        UNPUNT: return;
+        PUNT: ;
     }
 
     // Check payload for known magic bytes that defines files!
@@ -1381,6 +1476,9 @@ int main(int argc, char *argv[])
     opterr = 0;
     while ((ch = getopt(argc, argv, ARGS)) != -1)
         switch (ch) {
+        case 'E':
+            lazy_filter = 1;
+            break;
         case 'c':
             config.file = optarg;
             break;
